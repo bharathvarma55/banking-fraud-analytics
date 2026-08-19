@@ -1,0 +1,127 @@
+# Banking Fraud Analytics Platform
+
+An end-to-end fraud detection pipeline: synthetic transaction generation → object storage →
+warehouse staging → data quality gate → SQL feature engineering → ML modeling → BI dashboard
+with row-level security. Built as a portfolio project to demonstrate the full lifecycle a fraud
+analytics function actually owns, not just a model-in-a-notebook.
+
+## Problem
+
+Fraud detection is a rare-event classification problem: real-world fraud rates typically sit in
+the low single digits, and the operational cost of false positives (blocked legitimate
+transactions, review team hours) has to be weighed against the cost of false negatives (fraud
+loss). This project builds a pipeline that respects that reality — an intentionally imbalanced,
+signal-realistic dataset; a data quality gate that quarantines rather than silently drops bad
+rows; and a modeling comparison that's honest about how easy it is to draw the wrong conclusion
+from mismatched evaluation thresholds.
+
+## Architecture
+
+Cloud services were substituted with local equivalents that mirror the real API/SQL surface, to
+avoid incurring AWS cost while still exercising the real tooling:
+
+| Resume technology | Used as | Local substitute |
+|---|---|---|
+| AWS S3 | Raw landing zone | **MinIO** — same `boto3` S3 API, only the endpoint URL differs |
+| Snowflake | Warehouse / staging | **DuckDB** — same SQL dialect family (CTEs, window functions) |
+| Power BI | Dashboard + DAX + RLS | Power BI Desktop |
+| scikit-learn | Modeling | Isolation Forest + Logistic Regression |
+| Great Expectations pattern | Data quality | Direct SQL assertions against DuckDB, quarantine table |
+
+Full stage-by-stage lineage, including what each local substitute does and doesn't replicate
+about its real-cloud counterpart, is documented in [`LINEAGE.md`](LINEAGE.md).
+
+## Pipeline
+
+```
+01_generate_data.py       synthetic transactions + customers (one-time seed)
+02_upload_to_minio.py     local files -> MinIO raw zone
+03_load_to_duckdb.py      MinIO -> DuckDB staging tables
+04_data_quality_checks.py quality gate -> clean / quarantine tables
+05_feature_engineering.py SQL window functions -> velocity, recency, spend features
+06_modeling.py            Isolation Forest vs Logistic Regression, threshold analysis
+07_build_mart.py          scores + curated columns -> fraud_mart (Power BI source)
+run_pipeline.py           orchestrates steps 02-07, simulating a scheduled trigger
+```
+
+### Data generation design
+
+~495K synthetic transactions across 45,000 customers, ~2.5% fraud rate (deliberately
+imbalanced, not a balanced 50/50 toy set — detecting rare events is the actual hard part).
+Fraud is generated as **bursts** — 3,500 fraud "events," each firing 2-6 transactions within
+minutes at one customer — rather than independent random flags. This was a deliberate design
+choice validated during the project: an earlier version with independent random fraud labels
+produced velocity features (`txns_last_1hr`) with *zero* separation between fraud and non-fraud
+(1.02 vs 1.01) — the label didn't cause the pattern the feature was measuring. Switching to
+burst-structured fraud fixed this; see Results below for the before/after.
+
+Fraud also skews late-night (12am-4am, 3x weighted), out-of-region merchants, and three amount
+patterns (micro-charges for card testing, 3-8x outliers, round-number amounts). Three realistic
+data quality issues are deliberately injected (250 duplicate IDs, 400 null categories, 60
+negative amounts) so the quality gate has real defects to catch.
+
+### Data quality
+
+Every row is checked against explicit rules (duplicate ID, null category, negative amount).
+Failing rows are **quarantined with a reason**, never silently dropped — preserving a full audit
+trail. In this dataset: 709 of 495,467 rows quarantined, exactly matching (with one row failing
+two checks simultaneously) the counts deliberately injected during generation.
+
+### Feature engineering
+
+SQL window functions over the quality-gated table: `txns_last_1hr` / `txns_last_24hr`
+(trailing-window counts), `minutes_since_last_txn` (`LAG`), `rolling_avg_amt_prior_5txns`,
+`amt_zscore_vs_customer_baseline` (per-customer normalized deviation), plus `is_out_of_region`
+and `is_late_night` flags.
+
+## Results
+
+**Velocity feature validation** (the payoff of the burst-fraud design decision):
+
+| feature | non-fraud | fraud |
+|---|---|---|
+| avg `txns_last_1hr` | 0.021 | 1.446 |
+| avg `txns_last_24hr` | 0.360 | 1.796 |
+| avg minutes since last txn | 3585.5 | 970.6 |
+| % late night | 5.3% | 43.1% |
+| % out of region | 11.2% | 75.3% |
+
+**Model comparison** (held-out test set, stratified 70/30 split):
+
+- Logistic Regression: **PR-AUC 0.874**
+- At matched operating points (both flagging ~2.5% of transactions): LR reaches **0.825
+  precision / 0.822 recall**, versus Isolation Forest's 0.702 / 0.700 — supervised learning
+  outperforms unsupervised here, as expected, since it has direct access to labels.
+- An earlier, threshold-mismatched comparison (LR at a naive 0.5 cutoff vs. Isolation Forest at
+  its native contamination rate) made Isolation Forest look better on precision/recall — this
+  was an artifact of comparing different operating points, not a real finding, and is documented
+  here deliberately as a reminder to always evaluate models at matched thresholds.
+- A threshold sweep (0.10 to 0.95) traces the full precision/recall trade-off curve; the
+  operating threshold in the mart (0.90) was chosen as a reasonable starting point, not an
+  F1-optimum — in production this should be set from an actual cost matrix (dollar cost of a
+  missed fraud vs. a blocked legitimate transaction) and review-team capacity, not a statistical
+  default.
+
+## Dashboard
+
+Power BI Desktop, reading from the curated `fraud_mart` table (never raw or staging — BI tools
+should sit on a business-ready layer). DAX measures (`Model Precision`, `Model Recall`,
+`Fraud Rate`, etc.) are computed live via `CALCULATE`, so they recalculate correctly under any
+filter rather than being hardcoded snapshots. Static Row-Level Security restricts a demo role to
+South-region-only data, validated via Desktop's "View As Role."
+
+## Honest limitations
+
+- Synthetic data encodes fraud patterns the model is then evaluated against — real-world fraud
+  drift (new tactics not resembling past labeled examples) isn't represented; this is exactly
+  the scenario where the unsupervised Isolation Forest earns its keep despite lower measured
+  precision/recall here.
+- `amt_zscore_vs_customer_baseline` uses each customer's full-history mean/stddev rather than a
+  point-in-time trailing window, and the train/test split is random rather than time-based —
+  both introduce mild optimistic bias versus a true production evaluation.
+- RLS demonstrated is static, not the dynamic identity-mapped pattern that enforces on Power BI
+  Service in production (no tenant was provisioned for this project).
+- MinIO/DuckDB substitutes match the real services' API/SQL surface but not their operational
+  guarantees (durability, concurrency, RBAC) — see [`LINEAGE.md`](LINEAGE.md) for specifics.
+
+Full stage-by-stage lineage and governance notes: [`LINEAGE.md`](LINEAGE.md).

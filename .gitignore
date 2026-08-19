@@ -1,0 +1,10 @@
+venv/
+.env
+*.parquet
+warehouse.db
+minio.exe
+__pycache__/
+data_local/
+exports/
+fraud_model.joblib
+pipeline_run.log
